@@ -35,6 +35,9 @@ class Bot:
         self.executor = AlpacaExecutor(settings, self.storage)
         self.previous_acceleration: dict[str, float] = {}
         self.claude_cache: dict[str, tuple[float, object]] = {}
+        self.claude_budget_day = datetime.now(UTC).date()
+        self.claude_calls_today = 0
+        self.claude_spend_today = 0.0
         self.last_discovery_at = 0.0
 
     def scan_once(self) -> None:
@@ -66,7 +69,7 @@ class Bot:
             social = self.enrichment.social_data(symbol)
             preliminary = build_scores(snapshot, structural, catalyst, social, previous_acceleration=self.previous_acceleration.get(symbol))
             in_position = symbol in positions
-            analysis = self._analyze_with_claude_budget(symbol, snapshot, structural, catalyst, social, preliminary, in_position)
+            analysis, claude_status = self._analyze_with_claude_budget(symbol, snapshot, structural, catalyst, social, preliminary, in_position)
             scores = build_scores(
                 snapshot,
                 structural,
@@ -104,6 +107,12 @@ class Bot:
                 "social": asdict(social),
                 "scores": asdict(scores),
                 "claude": asdict(analysis),
+                "claude_status": claude_status,
+                "claude_budget": {
+                    "calls_today": self.claude_calls_today,
+                    "estimated_spend_today": round(self.claude_spend_today, 4),
+                    "daily_budget": settings.claude_daily_budget_usd,
+                },
                 "risk_state": asdict(risk_state),
                 "position": asdict(positions[symbol]) if symbol in positions else None,
                 "position_meta": asdict(meta) if symbol in positions and meta is not None else None,
@@ -119,15 +128,16 @@ class Bot:
                 risk_state.trades_today += 1
             elif executed and decision.action.value == "SELL":
                 risk_state.open_positions = max(0, risk_state.open_positions - 1)
-            log(f"{symbol}: {decision.action} | score={scores.composite:.1f} accel={scores.acceleration:.1f} | {decision.reason}")
+            log(f"{symbol}: {decision.action} | score={scores.composite:.1f} accel={scores.acceleration:.1f} | claude={claude_status} | {decision.reason}")
 
         self._maybe_swap(scored_positions, scored_entries, risk_state)
 
     def _analyze_with_claude_budget(self, symbol, snapshot, structural, catalyst, social, preliminary, in_position: bool):
+        self._reset_claude_budget_if_needed()
         cached = self.claude_cache.get(symbol)
         cache_minutes = settings.claude_position_cache_minutes if in_position else settings.claude_cache_minutes
         if cached and time.time() - cached[0] < max(1, cache_minutes) * 60:
-            return cached[1]
+            return cached[1], "cached"
 
         should_call = (
             settings.enable_claude_analysis
@@ -140,12 +150,39 @@ class Bot:
             )
         )
         if not should_call:
-            return self.claude.fallback(snapshot, catalyst, preliminary, "Claude skipped by cost gate; local heuristic analysis used.")
+            return self.claude.fallback(snapshot, catalyst, preliminary, "Claude skipped by cost gate; local heuristic analysis used."), "skipped_cost_gate"
+
+        projected_spend = self.claude_spend_today + settings.claude_estimated_cost_per_call_usd
+        if self.claude_calls_today >= settings.claude_max_calls_per_day:
+            return self.claude.fallback(snapshot, catalyst, preliminary, "Claude skipped because daily call limit was reached."), "skipped_daily_call_limit"
+        if projected_spend > settings.claude_daily_budget_usd:
+            return self.claude.fallback(snapshot, catalyst, preliminary, "Claude skipped because daily budget was reached."), "skipped_daily_budget"
 
         position_status = "held" if in_position else "none"
         analysis = self.claude.analyze(snapshot, structural, catalyst, social, preliminary, position_status=position_status)
+        self.claude_calls_today += 1
+        self.claude_spend_today += float(analysis.raw.get("_estimated_cost_usd", settings.claude_estimated_cost_per_call_usd) or settings.claude_estimated_cost_per_call_usd)
         self.claude_cache[symbol] = (time.time(), analysis)
-        return analysis
+        return analysis, "called"
+
+    def _reset_claude_budget_if_needed(self) -> None:
+        today = datetime.now(UTC).date()
+        if today != self.claude_budget_day:
+            self.claude_budget_day = today
+            self.claude_calls_today = 0
+            self.claude_spend_today = 0.0
+
+    def should_run_full_scan(self) -> tuple[bool, int, str]:
+        if not settings.enable_market_hours_throttle:
+            return True, settings.scan_interval_seconds, "market-hours throttle disabled"
+        session = self.executor.session_guard.current()
+        if session.is_open:
+            return True, settings.scan_interval_seconds, session.reason
+        if session.session == "premarket":
+            return True, settings.premarket_scan_interval_seconds, session.reason
+        if settings.enable_closed_market_discovery:
+            return True, settings.closed_market_scan_interval_seconds, session.reason
+        return False, settings.closed_market_scan_interval_seconds, session.reason
 
     def _run_discovery_if_due(self) -> None:
         self.storage.prune_opportunities(settings.opportunity_ttl_minutes)
@@ -227,11 +264,18 @@ def run_worker() -> None:
     while True:
         started = time.time()
         try:
-            bot.scan_once()
+            should_scan, sleep_seconds, session_reason = bot.should_run_full_scan()
+            if should_scan:
+                bot.scan_once()
+            else:
+                bot.executor.reconcile_pending_orders()
+                bot.storage.set_state("heartbeat", {"at": time.time(), "watchlist": list(settings.watchlist), "session": session_reason, "mode": "closed_market_throttle"})
+                log(f"Market closed throttle active: {session_reason}. Next light check in {sleep_seconds}s")
         except Exception as exc:
             print(f"Worker cycle failed: {exc}")
+            sleep_seconds = settings.scan_interval_seconds
         elapsed = time.time() - started
-        time.sleep(max(1, settings.scan_interval_seconds - elapsed))
+        time.sleep(max(1, sleep_seconds - elapsed))
 
 
 def main() -> None:

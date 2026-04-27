@@ -28,8 +28,8 @@ class ClaudeAnalyzer:
 
             client = Anthropic(api_key=self.settings.anthropic_api_key)
             response = client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=600,
+                model=self.settings.claude_model,
+                max_tokens=300,
                 temperature=0,
                 system=(
                     "You are the analysis layer for a rule-based trading system. "
@@ -41,6 +41,12 @@ class ClaudeAnalyzer:
             )
             text = response.content[0].text if response.content else "{}"
             parsed = self._parse_json(text)
+            usage = getattr(response, "usage", None)
+            input_tokens = float(getattr(usage, "input_tokens", 0) or 0)
+            output_tokens = float(getattr(usage, "output_tokens", 0) or 0)
+            estimated_cost = (input_tokens / 1_000_000 * 3.0) + (output_tokens / 1_000_000 * 15.0)
+            parsed["_usage"] = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+            parsed["_estimated_cost_usd"] = estimated_cost
             return ClaudeAnalysis(
                 vote=ClaudeVote(parsed.get("vote", "WATCH")),
                 confidence=float(parsed.get("confidence", 0.0)),

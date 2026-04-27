@@ -26,10 +26,15 @@ class SessionGuard:
                 payload = response.json()
                 if payload.get("is_open"):
                     return MarketSession(True, "regular", "Alpaca clock open")
-                return MarketSession(False, "closed", "Alpaca clock closed")
+                fallback = self._local_session()
+                return MarketSession(False, fallback.session, f"Alpaca clock closed; {fallback.reason}")
             except requests.RequestException:
                 pass
 
+        return self._local_session()
+
+    @staticmethod
+    def _local_session() -> MarketSession:
         now = datetime.now(ZoneInfo("America/New_York"))
         if now.weekday() >= 5:
             return MarketSession(False, "weekend", "market weekend fallback")
