@@ -11,6 +11,7 @@ from squeeze_bot.models import CatalystData, SocialData, StructuralData
 class EnrichmentClient:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self._google_trends_cache: dict[str, tuple[datetime, float]] = {}
 
     def structural_data(self, symbol: str) -> StructuralData:
         data = StructuralData()
@@ -83,6 +84,17 @@ class EnrichmentClient:
             return 0
 
     def _google_trends_change(self, symbol: str) -> float:
+        if not self.settings.enable_google_trends:
+            return 0.0
+
+        now = datetime.now(UTC)
+        cached = self._google_trends_cache.get(symbol)
+        if cached:
+            cached_at, cached_value = cached
+            refresh_after = timedelta(minutes=max(1, self.settings.google_trends_refresh_minutes))
+            if now - cached_at < refresh_after:
+                return cached_value
+
         try:
             from pytrends.request import TrendReq
 
@@ -96,6 +108,8 @@ class EnrichmentClient:
                 return 0.0
             baseline = sum(values[:6]) / 6
             recent = sum(values[6:]) / 6
-            return ((recent - baseline) / baseline * 100) if baseline else 0.0
+            change = ((recent - baseline) / baseline * 100) if baseline else 0.0
+            self._google_trends_cache[symbol] = (now, change)
+            return change
         except Exception:
             return 0.0

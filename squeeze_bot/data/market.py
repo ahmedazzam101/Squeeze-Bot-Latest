@@ -12,6 +12,7 @@ from squeeze_bot.models import MarketSnapshot, Position, RiskState
 class AlpacaMarketClient:
     def __init__(self, settings: Settings):
         self.settings = settings
+        self.last_error: str = ""
         self.headers = {
             "APCA-API-KEY-ID": settings.alpaca_api_key,
             "APCA-API-SECRET-KEY": settings.alpaca_secret_key,
@@ -23,15 +24,22 @@ class AlpacaMarketClient:
         return bool(self.settings.alpaca_api_key and self.settings.alpaca_secret_key)
 
     def snapshot(self, symbol: str) -> MarketSnapshot | None:
+        self.last_error = ""
         if not self.configured():
+            self.last_error = "Alpaca API key/secret are missing"
             return None
         try:
             bars = self._bars(symbol, "1Min", limit=80)
             daily = self._bars(symbol, "1Day", limit=31)
             quote = self._latest_quote(symbol)
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            self.last_error = f"Alpaca market-data request failed: {exc}"
             return None
         if not bars:
+            self.last_error = "Alpaca returned no recent 1-minute bars"
+            return None
+        if not daily:
+            self.last_error = "Alpaca returned no daily bars"
             return None
 
         closes = [float(bar["c"]) for bar in bars]
@@ -118,7 +126,7 @@ class AlpacaMarketClient:
 
     def _bars(self, symbol: str, timeframe: str, limit: int) -> list[dict]:
         end = datetime.now(UTC)
-        start = end - (timedelta(days=45) if timeframe == "1Day" else timedelta(days=2))
+        start = end - (timedelta(days=45) if timeframe == "1Day" else timedelta(days=7))
         params = {
             "symbols": symbol,
             "timeframe": timeframe,

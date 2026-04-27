@@ -5,8 +5,6 @@ import time
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 
-from apscheduler.schedulers.blocking import BlockingScheduler
-
 from squeeze_bot.config import settings
 from squeeze_bot.data.discovery import MarketDiscoveryClient
 from squeeze_bot.data.enrichment import EnrichmentClient
@@ -18,6 +16,10 @@ from squeeze_bot.engines.regime import RegimeFilter
 from squeeze_bot.engines.scoring import build_scores
 from squeeze_bot.models import PositionMeta
 from squeeze_bot.storage import Storage
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
 
 
 class Bot:
@@ -53,7 +55,8 @@ class Bot:
         for symbol in symbols:
             snapshot = self.market.snapshot(symbol)
             if snapshot is None:
-                print(f"{symbol}: skipped, no market snapshot available")
+                detail = f": {self.market.last_error}" if self.market.last_error else ""
+                log(f"{symbol}: skipped, no market snapshot available{detail}")
                 continue
             self.storage.update_candidate_returns(symbol, snapshot.price)
 
@@ -114,7 +117,7 @@ class Bot:
                 risk_state.trades_today += 1
             elif executed and decision.action.value == "SELL":
                 risk_state.open_positions = max(0, risk_state.open_positions - 1)
-            print(f"{symbol}: {decision.action} | score={scores.composite:.1f} accel={scores.acceleration:.1f} | {decision.reason}")
+            log(f"{symbol}: {decision.action} | score={scores.composite:.1f} accel={scores.acceleration:.1f} | {decision.reason}")
 
         self._maybe_swap(scored_positions, scored_entries, risk_state)
 
@@ -131,7 +134,7 @@ class Bot:
         for opportunity in discovered:
             self.storage.upsert_opportunity(opportunity)
         if discovered:
-            print(f"Discovery added: {', '.join(op.symbol for op in discovered)}")
+            log(f"Discovery added: {', '.join(op.symbol for op in discovered)}")
 
     def _maybe_swap(self, scored_positions: dict, scored_entries: dict, risk_state) -> None:
         if not settings.enable_swaps or not scored_positions or not scored_entries:
@@ -186,11 +189,23 @@ class Bot:
 
 def run_worker() -> None:
     bot = Bot()
-    scheduler = BlockingScheduler(timezone="America/New_York")
-    scheduler.add_job(bot.scan_once, "interval", seconds=settings.scan_interval_seconds, next_run_time=None)
-    print(f"Worker started. Watchlist={','.join(settings.watchlist)} interval={settings.scan_interval_seconds}s dry_run={settings.dry_run}")
-    bot.scan_once()
-    scheduler.start()
+    alpaca_status = "configured" if bot.market.configured() else "missing Alpaca API key/secret"
+    log(
+        "Worker started. "
+        f"Watchlist={','.join(settings.watchlist)} "
+        f"interval={settings.scan_interval_seconds}s "
+        f"dry_run={settings.dry_run} "
+        f"alpaca={alpaca_status} "
+        f"utc={datetime.now(UTC).isoformat()}"
+    )
+    while True:
+        started = time.time()
+        try:
+            bot.scan_once()
+        except Exception as exc:
+            print(f"Worker cycle failed: {exc}")
+        elapsed = time.time() - started
+        time.sleep(max(1, settings.scan_interval_seconds - elapsed))
 
 
 def main() -> None:

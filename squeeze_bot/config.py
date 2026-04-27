@@ -42,6 +42,8 @@ class Settings:
     reddit_client_id: str = os.getenv("REDDIT_CLIENT_ID", "")
     reddit_client_secret: str = os.getenv("REDDIT_CLIENT_SECRET", "")
     reddit_user_agent: str = os.getenv("REDDIT_USER_AGENT", "short-squeeze-bot/0.1")
+    enable_google_trends: bool = _bool("ENABLE_GOOGLE_TRENDS", True)
+    google_trends_refresh_minutes: int = _int("GOOGLE_TRENDS_REFRESH_MINUTES", 15)
     database_url: str = os.getenv("DATABASE_URL", "sqlite:///squeeze_bot.db")
     watchlist: tuple[str, ...] = tuple(
         symbol.strip().upper()
