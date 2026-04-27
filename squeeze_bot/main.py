@@ -34,6 +34,7 @@ class Bot:
         self.policy = TradingPolicy(settings)
         self.executor = AlpacaExecutor(settings, self.storage)
         self.previous_acceleration: dict[str, float] = {}
+        self.claude_cache: dict[str, tuple[float, object]] = {}
         self.last_discovery_at = 0.0
 
     def scan_once(self) -> None:
@@ -64,7 +65,8 @@ class Bot:
             catalyst = self.enrichment.catalyst_data(symbol)
             social = self.enrichment.social_data(symbol)
             preliminary = build_scores(snapshot, structural, catalyst, social, previous_acceleration=self.previous_acceleration.get(symbol))
-            analysis = self.claude.analyze(snapshot, structural, catalyst, social, preliminary)
+            in_position = symbol in positions
+            analysis = self._analyze_with_claude_budget(symbol, snapshot, structural, catalyst, social, preliminary, in_position)
             scores = build_scores(
                 snapshot,
                 structural,
@@ -120,6 +122,30 @@ class Bot:
             log(f"{symbol}: {decision.action} | score={scores.composite:.1f} accel={scores.acceleration:.1f} | {decision.reason}")
 
         self._maybe_swap(scored_positions, scored_entries, risk_state)
+
+    def _analyze_with_claude_budget(self, symbol, snapshot, structural, catalyst, social, preliminary, in_position: bool):
+        cached = self.claude_cache.get(symbol)
+        cache_minutes = settings.claude_position_cache_minutes if in_position else settings.claude_cache_minutes
+        if cached and time.time() - cached[0] < max(1, cache_minutes) * 60:
+            return cached[1]
+
+        should_call = (
+            settings.enable_claude_analysis
+            and bool(settings.anthropic_api_key)
+            and (
+                in_position
+                or preliminary.composite >= settings.claude_min_composite_score
+                or preliminary.acceleration >= settings.claude_min_acceleration_score
+                or (snapshot.rvol >= settings.claude_min_rvol and catalyst.news_count_24h > 0)
+            )
+        )
+        if not should_call:
+            return self.claude.fallback(snapshot, catalyst, preliminary, "Claude skipped by cost gate; local heuristic analysis used.")
+
+        position_status = "held" if in_position else "none"
+        analysis = self.claude.analyze(snapshot, structural, catalyst, social, preliminary, position_status=position_status)
+        self.claude_cache[symbol] = (time.time(), analysis)
+        return analysis
 
     def _run_discovery_if_due(self) -> None:
         self.storage.prune_opportunities(settings.opportunity_ttl_minutes)

@@ -20,8 +20,8 @@ class ClaudeAnalyzer:
         scores: Scores | None = None,
         position_status: str = "none",
     ) -> ClaudeAnalysis:
-        if not self.settings.anthropic_api_key:
-            return self._fallback(snapshot, catalyst, scores)
+        if not self.settings.anthropic_api_key or not self.settings.enable_claude_analysis:
+            return self.fallback(snapshot, catalyst, scores)
 
         try:
             from anthropic import Anthropic
@@ -52,9 +52,12 @@ class ClaudeAnalyzer:
                 raw=parsed,
             )
         except Exception as exc:
-            fallback = self._fallback(snapshot, catalyst, scores)
+            fallback = self.fallback(snapshot, catalyst, scores)
             fallback.summary = f"Claude unavailable; fallback analysis used: {exc}"
             return fallback
+
+    def fallback(self, snapshot: MarketSnapshot, catalyst: CatalystData, scores: Scores | None, reason: str = "Fallback heuristic analysis.") -> ClaudeAnalysis:
+        return self._fallback(snapshot, catalyst, scores, reason)
 
     @staticmethod
     def _parse_json(text: str) -> dict:
@@ -108,7 +111,7 @@ class ClaudeAnalyzer:
         }
 
     @staticmethod
-    def _fallback(snapshot: MarketSnapshot, catalyst: CatalystData, scores: Scores | None) -> ClaudeAnalysis:
+    def _fallback(snapshot: MarketSnapshot, catalyst: CatalystData, scores: Scores | None, reason: str = "Fallback heuristic analysis.") -> ClaudeAnalysis:
         if scores and scores.composite >= 70 and catalyst.news_count_24h > 0:
             vote = ClaudeVote.BUY_CANDIDATE
             confidence = 0.55
@@ -118,4 +121,4 @@ class ClaudeAnalyzer:
         else:
             vote = ClaudeVote.IGNORE
             confidence = 0.35
-        return ClaudeAnalysis(vote=vote, confidence=confidence, catalyst_quality=min(catalyst.news_count_24h / 4, 1.0), manipulation_risk=0.25, dilution_risk=0.0, summary="Fallback heuristic analysis.")
+        return ClaudeAnalysis(vote=vote, confidence=confidence, catalyst_quality=min(catalyst.news_count_24h / 4, 1.0), manipulation_risk=0.25, dilution_risk=0.0, summary=reason)
