@@ -50,7 +50,20 @@ class TradingPolicy:
                 regime_allows,
             ]
         )
-        if not (strict_path or high_conviction_path):
+        momentum_breakout_path = all(
+            [
+                self.settings.enable_momentum_breakout_entry,
+                scores.composite >= self.settings.momentum_min_composite_score,
+                scores.acceleration >= self.settings.momentum_min_acceleration_score,
+                scores.acceleration_rising,
+                snapshot.breakout_confirmed,
+                snapshot.rvol >= self.settings.momentum_min_rvol,
+                snapshot.above_vwap_candles >= self.settings.high_conviction_above_vwap_candles,
+                risk_flags_clear,
+                regime_allows,
+            ]
+        )
+        if not (strict_path or high_conviction_path or momentum_breakout_path):
             reasons = self._entry_block_reasons(snapshot, scores, analysis, regime_allows, regime_reason, claude_allows, risk_flags_clear)
             return Decision(
                 snapshot.symbol,
@@ -76,7 +89,7 @@ class TradingPolicy:
                 "entry_score": scores.composite,
                 "entry_acceleration": scores.acceleration,
                 "trailing_stop_pct": self.settings.trail_pct,
-                "entry_path": "strict" if strict_path else "high_conviction",
+                "entry_path": "strict" if strict_path else "high_conviction" if high_conviction_path else "momentum_breakout",
             },
         )
 

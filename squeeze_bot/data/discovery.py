@@ -25,7 +25,7 @@ class MarketDiscoveryClient:
         exclude = exclude or set()
         source_symbols = self._top_movers()
         opportunities: list[Opportunity] = []
-        for symbol in source_symbols:
+        for symbol in source_symbols[: self.settings.discovery_source_limit]:
             if symbol in exclude:
                 continue
             snapshot = self.market.snapshot(symbol)
@@ -38,7 +38,7 @@ class MarketDiscoveryClient:
                 continue
             if volume_signal < self.settings.discovery_min_rvol:
                 continue
-            score = self._opportunity_score(snapshot.intraday_change_pct, snapshot.rvol)
+            score = self._opportunity_score(snapshot.intraday_change_pct, volume_signal)
             opportunities.append(
                 Opportunity(
                     symbol=symbol,
@@ -63,7 +63,7 @@ class MarketDiscoveryClient:
         ]
         for endpoint in endpoints:
             try:
-                response = requests.get(endpoint, headers=self.headers, params={"top": 50}, timeout=12)
+                response = requests.get(endpoint, headers=self.headers, params={"top": self.settings.discovery_source_limit}, timeout=12)
                 if not response.ok:
                     continue
                 payload = response.json()

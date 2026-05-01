@@ -145,8 +145,10 @@ class Bot:
             and (
                 in_position
                 or preliminary.composite >= settings.claude_min_composite_score
-                or preliminary.acceleration >= settings.claude_min_acceleration_score
-                or (snapshot.rvol >= settings.claude_min_rvol and catalyst.news_count_24h > 0)
+                or (
+                    preliminary.acceleration >= settings.claude_min_acceleration_score
+                    and snapshot.rvol >= settings.claude_min_rvol
+                )
             )
         )
         if not should_call:

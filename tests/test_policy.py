@@ -57,6 +57,27 @@ def test_policy_allows_high_conviction_watch_vote():
     assert decision.metadata["entry_path"] == "high_conviction"
 
 
+def test_policy_allows_momentum_breakout_when_structural_data_is_incomplete():
+    policy = TradingPolicy(Settings(require_regime_filter=False))
+    snapshot = MarketSnapshot(
+        symbol="MOMO",
+        price=10,
+        rvol=3.4,
+        vwap=9.7,
+        above_vwap_candles=1,
+        premarket_high=9.8,
+        resistance=9.9,
+        bid=9.98,
+        ask=10.02,
+    )
+    scores = Scores(50, 68, 45, 45, 56, True)
+    analysis = ClaudeAnalysis(ClaudeVote.WATCH, 0.45, 0.2, 0.2, 0.1, "fallback watch")
+    risk = RiskState(10_000, 10_000, 0, 0, 0, 0)
+    decision = policy.decide_entry(snapshot, scores, analysis, risk, True, "ok")
+    assert decision.action == TradeAction.BUY
+    assert decision.metadata["entry_path"] == "momentum_breakout"
+
+
 def test_policy_records_block_reasons():
     policy = TradingPolicy(Settings(require_regime_filter=False))
     snapshot = MarketSnapshot(symbol="TEST", price=10, rvol=1, vwap=11, above_vwap_candles=0)
