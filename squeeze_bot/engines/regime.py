@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import yfinance as yf
 
+from squeeze_bot.config import settings
+
 
 class RegimeFilter:
     def passes(self) -> tuple[bool, str]:
@@ -13,4 +15,6 @@ class RegimeFilter:
             passed = vix_last >= 18 or spy_move >= 1
             return passed, f"VIX={vix_last:.2f}, SPY move={spy_move:.2f}%"
         except Exception as exc:
+            if settings.fail_open_on_regime_unavailable:
+                return True, f"Regime unavailable; fail-open enabled: {exc}"
             return False, f"Regime unavailable: {exc}"

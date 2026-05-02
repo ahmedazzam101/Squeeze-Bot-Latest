@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime, timedelta
 from statistics import mean
 
@@ -19,12 +20,19 @@ class AlpacaMarketClient:
         }
         self.data_base = "https://data.alpaca.markets"
         self.trade_base = "https://paper-api.alpaca.markets" if settings.alpaca_paper else "https://api.alpaca.markets"
+        self._snapshot_cache: dict[str, tuple[float, MarketSnapshot]] = {}
+        self._positions_cache: tuple[float, dict[str, Position]] | None = None
 
     def configured(self) -> bool:
         return bool(self.settings.alpaca_api_key and self.settings.alpaca_secret_key)
 
-    def snapshot(self, symbol: str) -> MarketSnapshot | None:
+    def snapshot(self, symbol: str, use_cache: bool = True) -> MarketSnapshot | None:
         self.last_error = ""
+        symbol = symbol.upper()
+        if use_cache:
+            cached = self._snapshot_cache.get(symbol)
+            if cached and time.time() - cached[0] < max(1, self.settings.market_snapshot_cache_seconds):
+                return cached[1]
         if not self.configured():
             self.last_error = "Alpaca API key/secret are missing"
             return None
@@ -58,7 +66,7 @@ class AlpacaMarketClient:
         volume_growth = ((recent_volume - baseline_volume) / baseline_volume * 100) if baseline_volume else 0.0
         volatility_expansion = self._volatility_expansion(closes)
 
-        return MarketSnapshot(
+        snapshot = MarketSnapshot(
             symbol=symbol,
             price=price,
             previous_close=previous_close,
@@ -77,6 +85,8 @@ class AlpacaMarketClient:
             volume_growth_pct=volume_growth,
             volatility_expansion_pct=volatility_expansion,
         )
+        self._snapshot_cache[symbol] = (time.time(), snapshot)
+        return snapshot
 
     def account_risk_state(self) -> RiskState:
         if not self.configured():
@@ -98,7 +108,9 @@ class AlpacaMarketClient:
             losses_today=0,
         )
 
-    def positions(self) -> dict[str, Position]:
+    def positions(self, use_cache: bool = True) -> dict[str, Position]:
+        if use_cache and self._positions_cache and time.time() - self._positions_cache[0] < max(1, self.settings.positions_cache_seconds):
+            return dict(self._positions_cache[1])
         if not self.configured():
             return {}
         try:
@@ -122,6 +134,7 @@ class AlpacaMarketClient:
                 market_value=float(row.get("market_value", 0) or 0),
                 unrealized_gain_pct=float(row.get("unrealized_plpc", 0) or 0) * 100,
             )
+        self._positions_cache = (time.time(), positions)
         return positions
 
     def _bars(self, symbol: str, timeframe: str, limit: int) -> list[dict]:
