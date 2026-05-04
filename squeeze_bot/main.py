@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import time
+from collections import Counter
 from dataclasses import asdict, replace
 from datetime import UTC, datetime
 
@@ -42,6 +43,18 @@ class Bot:
 
     def scan_once(self) -> None:
         self.executor.reconcile_pending_orders()
+        summary = {
+            "symbols": 0,
+            "scored": 0,
+            "skipped_snapshot": 0,
+            "executed_buy": 0,
+            "executed_sell": 0,
+        }
+        action_counts: Counter[str] = Counter()
+        claude_status_counts: Counter[str] = Counter()
+        snapshot_error_counts: Counter[str] = Counter()
+        top_candidates: list[dict] = []
+        self.enrichment.reset_status()
         self.storage.set_state("heartbeat", {"at": time.time(), "watchlist": list(settings.watchlist)})
         self._run_discovery_if_due()
         regime_passed, regime_reason = self.regime.passes()
@@ -54,11 +67,15 @@ class Bot:
         opportunity_symbols = [op.symbol for op in opportunities]
         opportunity_sources = {op.symbol: op.source for op in opportunities}
         symbols = list(dict.fromkeys([*settings.watchlist, *opportunity_symbols, *positions.keys()]))
+        summary["symbols"] = len(symbols)
         scored_entries: dict[str, tuple] = {}
         scored_positions: dict[str, tuple] = {}
         for symbol in symbols:
             snapshot = self.market.snapshot(symbol)
             if snapshot is None:
+                summary["skipped_snapshot"] += 1
+                if self.market.last_error:
+                    snapshot_error_counts[self._short_error(self.market.last_error)] += 1
                 detail = f": {self.market.last_error}" if self.market.last_error else ""
                 log(f"{symbol}: skipped, no market snapshot available{detail}")
                 continue
@@ -78,6 +95,8 @@ class Bot:
                 claude_catalyst_quality=analysis.catalyst_quality,
                 previous_acceleration=self.previous_acceleration.get(symbol),
             )
+            summary["scored"] += 1
+            claude_status_counts[claude_status] += 1
             self.previous_acceleration[symbol] = scores.acceleration
             if symbol in positions:
                 position = positions[symbol]
@@ -100,6 +119,19 @@ class Bot:
                 decision = self.policy.decide_entry(snapshot, scores, analysis, risk_state, regime_passed, regime_reason)
                 if symbol in opportunity_symbols:
                     scored_entries[symbol] = (scores, analysis, decision, snapshot, regime_passed, regime_reason)
+            action_counts[decision.action.value] += 1
+            top_candidates.append(
+                {
+                    "symbol": symbol,
+                    "score": scores.composite,
+                    "acceleration": scores.acceleration,
+                    "rvol": snapshot.rvol,
+                    "breakout": snapshot.breakout_confirmed,
+                    "action": decision.action.value,
+                    "reason": decision.reason,
+                    "in_position": symbol in positions,
+                }
+            )
             payload = {
                 "snapshot": asdict(snapshot),
                 "structural": asdict(structural),
@@ -126,11 +158,25 @@ class Bot:
             if executed and decision.action.value == "BUY":
                 risk_state.open_positions += 1
                 risk_state.trades_today += 1
+                summary["executed_buy"] += 1
             elif executed and decision.action.value == "SELL":
                 risk_state.open_positions = max(0, risk_state.open_positions - 1)
+                summary["executed_sell"] += 1
             log(f"{symbol}: {decision.action} | score={scores.composite:.1f} accel={scores.acceleration:.1f} | claude={claude_status} | {decision.reason}")
 
         self._maybe_swap(scored_positions, scored_entries, risk_state)
+        self._log_scan_summary(
+            summary,
+            action_counts,
+            claude_status_counts,
+            snapshot_error_counts,
+            top_candidates,
+            self.enrichment.status_summary(),
+            risk_state,
+            regime_passed,
+            regime_reason,
+            len(opportunities),
+        )
 
     def _analyze_with_claude_budget(self, symbol, snapshot, structural, catalyst, social, preliminary, in_position: bool):
         self._reset_claude_budget_if_needed()
@@ -199,7 +245,13 @@ class Bot:
         for opportunity in discovered:
             self.storage.upsert_opportunity(opportunity)
         if discovered:
-            log(f"Discovery added: {', '.join(op.symbol for op in discovered)}")
+            log(
+                "Discovery added "
+                f"{len(discovered)}/{settings.discovery_max_symbols}: "
+                f"{', '.join(op.symbol for op in discovered)}"
+            )
+        else:
+            log("Discovery found no new candidates")
 
     def _maybe_swap(self, scored_positions: dict, scored_entries: dict, risk_state) -> None:
         if not settings.enable_swaps or not scored_positions or not scored_entries:
@@ -251,6 +303,126 @@ class Bot:
         self.storage.log_scan(candidate_symbol, candidate_snapshot.price, candidate_scores, candidate_decision, {"swap_exit": held_symbol, "decision": asdict(candidate_decision)})
         self.executor.execute(candidate_decision, candidate_snapshot.price)
 
+    def api_health_line(self) -> str:
+        alpaca = "configured" if self.market.configured() else "missing"
+        execution_mode = "paper" if settings.alpaca_paper else "live"
+        execution = "enabled" if settings.enable_alpaca_execution else "disabled"
+        claude = "configured" if settings.anthropic_api_key else "missing"
+        fmp = "configured" if settings.fmp_api_key else "missing"
+        finnhub = "configured" if settings.finnhub_api_key else "missing"
+        reddit = "configured" if settings.reddit_client_id and settings.reddit_client_secret else "missing"
+        google_trends = "enabled" if settings.enable_google_trends else "disabled"
+        return (
+            "API health: "
+            f"alpaca={alpaca} execution={execution}_{execution_mode} dry_run={settings.dry_run} "
+            f"claude={claude} model={settings.claude_model} "
+            f"claude_budget=${settings.claude_daily_budget_usd:.2f}/day max_calls={settings.claude_max_calls_per_day} "
+            f"fmp={fmp} finnhub={finnhub} reddit={reddit} google_trends={google_trends} "
+            f"discovery=every_{settings.discovery_interval_seconds}s max_symbols={settings.discovery_max_symbols} "
+            f"opportunity_scan_limit={settings.opportunity_scan_limit} snapshot_cache={settings.market_snapshot_cache_seconds}s"
+        )
+
+    def _log_scan_summary(
+        self,
+        summary: dict,
+        action_counts: Counter[str],
+        claude_status_counts: Counter[str],
+        snapshot_error_counts: Counter[str],
+        top_candidates: list[dict],
+        enrichment_summary: dict,
+        risk_state,
+        regime_passed: bool,
+        regime_reason: str,
+        active_opportunities: int,
+    ) -> None:
+        if not settings.log_scan_summary:
+            return
+        self.storage.set_state(
+            "last_scan_summary",
+            {
+                "at": time.time(),
+                "summary": summary,
+                "actions": dict(action_counts),
+                "claude": dict(claude_status_counts),
+                "snapshot_errors": dict(snapshot_error_counts),
+                "enrichment": enrichment_summary,
+                "top_candidates": sorted(top_candidates, key=lambda item: item["score"], reverse=True)[: settings.log_top_candidates],
+                "regime": {"passed": regime_passed, "reason": regime_reason},
+            },
+        )
+        log(
+            "Scan summary: "
+            f"symbols={summary['symbols']} scored={summary['scored']} "
+            f"snapshot_skips={summary['skipped_snapshot']} "
+            f"actions={self._format_counter(action_counts)} "
+            f"executed_buy={summary['executed_buy']} executed_sell={summary['executed_sell']} "
+            f"active_opportunities={active_opportunities} "
+            f"risk=open_positions:{risk_state.open_positions}/{settings.max_open_positions},"
+            f"trades_today:{risk_state.trades_today}/{settings.max_trades_per_day},"
+            f"losses_today:{risk_state.losses_today}/{settings.stop_after_losses},"
+            f"buying_power:{risk_state.buying_power:.2f} "
+            f"regime={'pass' if regime_passed else 'block'}({regime_reason}) "
+            f"claude={self._format_counter(claude_status_counts)} "
+            f"claude_spend=${self.claude_spend_today:.4f}/${settings.claude_daily_budget_usd:.2f}"
+        )
+        enrichment_status = Counter(enrichment_summary.get("status", {}))
+        enrichment_errors = Counter(enrichment_summary.get("errors", {}))
+        log(f"Data sources: {self._format_counter(enrichment_status, limit=8)}")
+        if enrichment_errors:
+            log(f"Data source issues: {self._format_counter(enrichment_errors, limit=5)}")
+        if snapshot_error_counts:
+            log(f"Snapshot issues: {self._format_counter(snapshot_error_counts, limit=3)}")
+        self._log_top_candidates(top_candidates)
+
+    def _log_top_candidates(self, candidates: list[dict]) -> None:
+        limit = max(0, settings.log_top_candidates)
+        if limit == 0 or not candidates:
+            return
+        ranked = sorted(candidates, key=lambda item: item["score"], reverse=True)[:limit]
+        parts = []
+        for item in ranked:
+            parts.append(
+                f"{item['symbol']} score={item['score']:.1f} accel={item['acceleration']:.1f} "
+                f"rvol={item['rvol']:.2f} breakout={item['breakout']} "
+                f"action={item['action']} reason={self._clip(item['reason'], 90)}"
+            )
+        log(f"Top candidates: {' | '.join(parts)}")
+        buys = [item for item in candidates if item["action"] == "BUY"]
+        if not buys:
+            best = ranked[0]
+            log(
+                "No buy this cycle: "
+                f"best={best['symbol']} score={best['score']:.1f} accel={best['acceleration']:.1f} "
+                f"rvol={best['rvol']:.2f} blocked_by={self._clip(best['reason'], 140)}"
+            )
+
+    @staticmethod
+    def _format_counter(counter: Counter[str], limit: int | None = None) -> str:
+        if not counter:
+            return "none"
+        items = counter.most_common(limit)
+        return ",".join(f"{key}:{value}" for key, value in items)
+
+    @staticmethod
+    def _clip(value: str, limit: int) -> str:
+        clean = " ".join(str(value).split())
+        if len(clean) <= limit:
+            return clean
+        return clean[: max(0, limit - 3)] + "..."
+
+    @classmethod
+    def _short_error(cls, value: str) -> str:
+        text = str(value)
+        if "Connection reset by peer" in text:
+            return "alpaca_connection_reset"
+        if "Read timed out" in text or "read timeout" in text.lower():
+            return "alpaca_read_timeout"
+        if "Max retries exceeded" in text:
+            return "alpaca_max_retries"
+        if "429" in text or "rate limit" in text.lower():
+            return "rate_limited"
+        return cls._clip(text, 80)
+
 
 def run_worker() -> None:
     bot = Bot()
@@ -263,6 +435,8 @@ def run_worker() -> None:
         f"alpaca={alpaca_status} "
         f"utc={datetime.now(UTC).isoformat()}"
     )
+    if settings.log_api_health:
+        log(bot.api_health_line())
     while True:
         started = time.time()
         try:
