@@ -17,12 +17,21 @@ class TradingPolicy:
             and scores.composite >= self.settings.high_conviction_score
             and scores.acceleration >= self.settings.high_conviction_acceleration
         )
+        near_breakout = snapshot.near_breakout(self.settings.early_probe_breakout_distance_pct)
+        stock_specific_regime_bypass = (
+            self.settings.allow_stock_specific_regime_bypass
+            and scores.acceleration >= self.settings.early_probe_min_acceleration_score
+            and scores.acceleration_rising
+            and snapshot.rvol >= self.settings.early_probe_min_rvol
+            and near_breakout
+            and snapshot.above_vwap_candles >= self.settings.high_conviction_above_vwap_candles
+        )
         regime_allows = regime_passed or not self.settings.require_regime_filter or (
             self.settings.allow_high_conviction_regime_bypass
             and scores.composite >= self.settings.high_conviction_score
             and scores.acceleration >= self.settings.high_conviction_acceleration
             and snapshot.rvol >= self.settings.min_rvol
-        )
+        ) or stock_specific_regime_bypass
         risk_flags_clear = analysis.dilution_risk < 0.65 and analysis.vote != ClaudeVote.EXIT_NOW_CATALYST_RISK
 
         strict_path = all(
@@ -56,14 +65,27 @@ class TradingPolicy:
                 scores.composite >= self.settings.momentum_min_composite_score,
                 scores.acceleration >= self.settings.momentum_min_acceleration_score,
                 scores.acceleration_rising,
-                snapshot.breakout_confirmed,
+                near_breakout,
                 snapshot.rvol >= self.settings.momentum_min_rvol,
                 snapshot.above_vwap_candles >= self.settings.high_conviction_above_vwap_candles,
                 risk_flags_clear,
                 regime_allows,
             ]
         )
-        if not (strict_path or high_conviction_path or momentum_breakout_path):
+        early_squeeze_probe_path = all(
+            [
+                self.settings.enable_early_squeeze_probe,
+                scores.composite >= self.settings.early_probe_min_composite_score,
+                scores.acceleration >= self.settings.early_probe_min_acceleration_score,
+                scores.acceleration_rising,
+                near_breakout,
+                snapshot.rvol >= self.settings.early_probe_min_rvol,
+                snapshot.above_vwap_candles >= self.settings.high_conviction_above_vwap_candles,
+                risk_flags_clear,
+                regime_allows,
+            ]
+        )
+        if not (strict_path or high_conviction_path or momentum_breakout_path or early_squeeze_probe_path):
             reasons = self._entry_block_reasons(snapshot, scores, analysis, regime_allows, regime_reason, claude_allows, risk_flags_clear)
             return Decision(
                 snapshot.symbol,
@@ -78,10 +100,21 @@ class TradingPolicy:
         quantity, stop_price = self.risk.position_size(risk_state, snapshot)
         if quantity <= 0:
             return Decision(snapshot.symbol, TradeAction.WATCH, "position size resolved to zero")
+        entry_path = (
+            "strict"
+            if strict_path
+            else "high_conviction"
+            if high_conviction_path
+            else "momentum_breakout"
+            if momentum_breakout_path
+            else "early_squeeze_probe"
+        )
+        if entry_path == "early_squeeze_probe":
+            quantity = max(1, int(quantity * max(0.1, min(1.0, self.settings.early_probe_risk_multiplier))))
         return Decision(
             symbol=snapshot.symbol,
             action=TradeAction.BUY,
-            reason="all entry gates passed",
+            reason=f"{entry_path} entry gates passed",
             quantity=quantity,
             stop_price=stop_price,
             limit_price=snapshot.ask or snapshot.price,
@@ -89,7 +122,9 @@ class TradingPolicy:
                 "entry_score": scores.composite,
                 "entry_acceleration": scores.acceleration,
                 "trailing_stop_pct": self.settings.trail_pct,
-                "entry_path": "strict" if strict_path else "high_conviction" if high_conviction_path else "momentum_breakout",
+                "entry_path": entry_path,
+                "breakout_distance_pct": snapshot.breakout_distance_pct,
+                "stock_specific_regime_bypass": stock_specific_regime_bypass,
             },
         )
 
@@ -109,7 +144,10 @@ class TradingPolicy:
         if not scores.acceleration_rising:
             reasons.append("acceleration not rising")
         if not snapshot.breakout_confirmed:
-            reasons.append("breakout not confirmed")
+            if snapshot.near_breakout(self.settings.early_probe_breakout_distance_pct):
+                reasons.append(f"near breakout ({snapshot.breakout_distance_pct:.2f}% below level)")
+            else:
+                reasons.append("breakout not confirmed")
         if snapshot.rvol < self.settings.high_conviction_rvol:
             reasons.append(f"RVOL {snapshot.rvol:.2f} below {self.settings.high_conviction_rvol}")
         if snapshot.above_vwap_candles < self.settings.high_conviction_above_vwap_candles:

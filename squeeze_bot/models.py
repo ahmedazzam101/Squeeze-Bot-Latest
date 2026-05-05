@@ -54,9 +54,23 @@ class MarketSnapshot:
         return ((self.ask - self.bid) / midpoint) * 100 if midpoint else 0.0
 
     @property
+    def breakout_level(self) -> float:
+        return max(self.premarket_high, self.resistance)
+
+    @property
     def breakout_confirmed(self) -> bool:
-        level = max(self.premarket_high, self.resistance)
+        level = self.breakout_level
         return bool(level > 0 and self.price > level)
+
+    @property
+    def breakout_distance_pct(self) -> float:
+        level = self.breakout_level
+        if level <= 0:
+            return 100.0
+        return ((level - self.price) / level) * 100
+
+    def near_breakout(self, max_distance_pct: float) -> bool:
+        return self.breakout_confirmed or (self.breakout_level > 0 and 0 <= self.breakout_distance_pct <= max_distance_pct)
 
 
 @dataclass
