@@ -28,6 +28,8 @@ class MarketDiscoveryClient:
         for symbol in source_symbols[: self.settings.discovery_source_limit]:
             if symbol in exclude:
                 continue
+            if self.settings.discovery_common_stocks_only and not self._looks_like_common_stock(symbol):
+                continue
             snapshot = self.market.snapshot(symbol)
             if snapshot is None:
                 continue
@@ -88,6 +90,17 @@ class MarketDiscoveryClient:
                 if symbol:
                     symbols.append(str(symbol).upper())
         return symbols
+
+    @staticmethod
+    def _looks_like_common_stock(symbol: str) -> bool:
+        symbol = symbol.upper()
+        if "." in symbol or "/" in symbol:
+            return False
+        if symbol.endswith(("WS", "WT")):
+            return False
+        if len(symbol) >= 5 and symbol.endswith(("W", "U", "R")):
+            return False
+        return True
 
     @staticmethod
     def _opportunity_score(move_pct: float, rvol: float) -> float:

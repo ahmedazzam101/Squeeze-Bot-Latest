@@ -85,6 +85,7 @@ class Settings:
     discovery_min_price: float = _float("DISCOVERY_MIN_PRICE", 1.0)
     discovery_min_move_pct: float = _float("DISCOVERY_MIN_MOVE_PCT", 4.0)
     discovery_min_rvol: float = _float("DISCOVERY_MIN_RVOL", 1.5)
+    discovery_common_stocks_only: bool = _bool("DISCOVERY_COMMON_STOCKS_ONLY", True)
     enable_swaps: bool = _bool("ENABLE_SWAPS", True)
     swap_min_score: float = _float("SWAP_MIN_SCORE", 76.0)
     swap_score_advantage: float = _float("SWAP_SCORE_ADVANTAGE", 12.0)

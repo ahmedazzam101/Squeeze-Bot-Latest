@@ -29,15 +29,31 @@ class AlpacaExecutor:
         side = "buy" if decision.action == TradeAction.BUY else "sell"
         if decision.quantity <= 0:
             self.storage.log_order(decision.symbol, side, 0, market_price, "skipped_zero_quantity", decision.__dict__)
+            self._log_event(decision.symbol, side, "skipped_zero_quantity", "quantity was 0")
             return False
         session = self.session_guard.current()
         if not session.is_open:
-            self.storage.log_order(decision.symbol, side, decision.quantity, market_price, f"deferred_{session.session}", {"decision": decision.__dict__, "session": session.__dict__})
+            status = f"deferred_{session.session}"
+            self.storage.log_order(decision.symbol, side, decision.quantity, market_price, status, {"decision": decision.__dict__, "session": session.__dict__})
+            self._log_event(
+                decision.symbol,
+                side,
+                status,
+                f"{session.reason}; regular-hours trading only",
+                decision.quantity,
+                market_price,
+            )
             return False
         if self.settings.dry_run or not self.settings.enable_alpaca_execution:
             self.storage.log_order(decision.symbol, side, decision.quantity, market_price, "dry_run", decision.__dict__)
+            mode = "DRY_RUN=true" if self.settings.dry_run else "ENABLE_ALPACA_EXECUTION=false"
+            self._log_event(decision.symbol, side, "dry_run", mode, decision.quantity, market_price)
             self._apply_local_fill(decision, side, market_price)
             return True
+        if self._has_pending_order(decision.symbol, side):
+            self.storage.log_order(decision.symbol, side, decision.quantity, market_price, "skipped_existing_pending_order", decision.__dict__)
+            self._log_event(decision.symbol, side, "skipped_existing_pending_order", "same symbol/side already waiting at Alpaca", decision.quantity, market_price)
+            return False
         payload = {
             "symbol": decision.symbol,
             "qty": str(decision.quantity),
@@ -51,6 +67,14 @@ class AlpacaExecutor:
         status = "submitted" if response.ok else f"error_{response.status_code}"
         response_payload = self._safe_json(response)
         self.storage.log_order(decision.symbol, side, decision.quantity, market_price, status, {"request": payload, "response": response_payload})
+        self._log_event(
+            decision.symbol,
+            side,
+            status,
+            self._response_summary(response_payload),
+            decision.quantity,
+            market_price,
+        )
         if not response.ok:
             return False
         order_id = str(response_payload.get("id", ""))
@@ -61,8 +85,11 @@ class AlpacaExecutor:
                 fill_price = float(fill.get("filled_avg_price") or market_price)
                 self.storage.update_pending_order(order_id, "filled", fill)
                 self.storage.log_order(decision.symbol, side, decision.quantity, fill_price, "filled", fill)
+                self._log_event(decision.symbol, side, "filled", f"order_id={order_id}", decision.quantity, fill_price)
                 self._apply_local_fill(decision, side, fill_price)
                 return True
+            if fill:
+                self._log_event(decision.symbol, side, f"pending_{fill.get('status', 'unknown')}", f"order_id={order_id}", decision.quantity, market_price)
         return False
 
     def reconcile_pending_orders(self) -> None:
@@ -78,6 +105,7 @@ class AlpacaExecutor:
                 price = float(payload.get("filled_avg_price") or 0)
                 self.storage.update_pending_order(order.alpaca_order_id, "filled", payload)
                 self.storage.log_order(order.symbol, order.side, order.quantity, price, "filled_reconciled", payload)
+                self._log_event(order.symbol, order.side, "filled_reconciled", f"order_id={order.alpaca_order_id}", order.quantity, price)
                 decision_payload = self._pending_decision_payload(order.payload_json)
                 decision = Decision(
                     symbol=order.symbol,
@@ -90,10 +118,12 @@ class AlpacaExecutor:
                 self._apply_local_fill(decision, order.side, price)
             elif status in {"canceled", "expired", "rejected"}:
                 self.storage.update_pending_order(order.alpaca_order_id, status, payload)
+                self._log_event(order.symbol, order.side, status, f"order_id={order.alpaca_order_id}", order.quantity, 0)
             elif order.created_at.replace(tzinfo=UTC) < cutoff:
                 cancel = self._cancel_order(order.alpaca_order_id)
                 self.storage.update_pending_order(order.alpaca_order_id, "stale_canceled", cancel or payload)
                 self.storage.log_order(order.symbol, order.side, order.quantity, 0, "stale_canceled", cancel or payload)
+                self._log_event(order.symbol, order.side, "stale_canceled", f"order_id={order.alpaca_order_id}", order.quantity, 0)
 
     def _apply_local_fill(self, decision: Decision, side: str, fill_price: float) -> None:
         if side == "buy":
@@ -154,3 +184,22 @@ class AlpacaExecutor:
             return decision if isinstance(decision, dict) else {}
         except Exception:
             return {}
+
+    def _has_pending_order(self, symbol: str, side: str) -> bool:
+        symbol = symbol.upper()
+        return any(order.symbol.upper() == symbol and order.side == side for order in self.storage.open_pending_orders())
+
+    @staticmethod
+    def _response_summary(payload: dict) -> str:
+        for key in ("message", "code", "status", "id"):
+            value = payload.get(key)
+            if value:
+                return f"{key}={value}"
+        text = str(payload.get("text", "") or "").strip()
+        return text[:180] if text else "no Alpaca response detail"
+
+    @staticmethod
+    def _log_event(symbol: str, side: str, status: str, detail: str, quantity: float | None = None, price: float | None = None) -> None:
+        qty_part = f" qty={quantity:g}" if quantity is not None else ""
+        price_part = f" price={price:.2f}" if price is not None and price > 0 else ""
+        print(f"Order {status}: {symbol} {side}{qty_part}{price_part} | {detail}", flush=True)
