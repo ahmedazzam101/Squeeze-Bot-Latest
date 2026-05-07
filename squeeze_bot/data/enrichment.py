@@ -22,6 +22,7 @@ class EnrichmentClient:
         self._social_cache: dict[str, tuple[datetime, SocialData]] = {}
         self._reddit_cache: dict[str, tuple[datetime, int]] = {}
         self._google_trends_cache: dict[str, tuple[datetime, float]] = {}
+        self._disabled_sources: set[str] = set()
         self.source_status: Counter[str] = Counter()
         self.source_errors: Counter[str] = Counter()
 
@@ -39,7 +40,9 @@ class EnrichmentClient:
             self._mark_source("fmp", "cached")
             return cached
         data = StructuralData()
-        if self.settings.fmp_api_key:
+        if self._source_disabled("fmp"):
+            self._mark_source("fmp", "disabled")
+        elif self.settings.fmp_api_key:
             data = self._fmp_structural(symbol, data)
         else:
             self._mark_source("fmp", "missing")
@@ -89,7 +92,11 @@ class EnrichmentClient:
             profile_response.raise_for_status()
             profile = profile_response.json()
         except requests.RequestException as exc:
-            self._mark_source("fmp", "error", self._request_error_key(exc))
+            error_key = self._request_error_key(exc)
+            self._mark_source("fmp", "error", error_key)
+            if self._is_auth_error(error_key):
+                self._disable_source("fmp")
+                self._disable_source("fmp_float")
             profile = []
             profile_failed = True
         if isinstance(profile, list) and profile:
@@ -105,6 +112,9 @@ class EnrichmentClient:
         return data
 
     def _fmp_float(self, symbol: str, data: StructuralData) -> StructuralData:
+        if self._source_disabled("fmp_float"):
+            self._mark_source("fmp_float", "disabled")
+            return data
         try:
             response = self.http.get(
                 "https://financialmodelingprep.com/api/v4/shares_float",
@@ -114,7 +124,10 @@ class EnrichmentClient:
             response.raise_for_status()
             rows = response.json()
         except requests.RequestException as exc:
-            self._mark_source("fmp_float", "error", self._request_error_key(exc))
+            error_key = self._request_error_key(exc)
+            self._mark_source("fmp_float", "error", error_key)
+            if self._is_auth_error(error_key):
+                self._disable_source("fmp_float")
             return data
         if isinstance(rows, list) and rows:
             item = rows[0]
@@ -147,6 +160,9 @@ class EnrichmentClient:
         return headlines
 
     def _reddit_mentions(self, symbol: str) -> int:
+        if self._source_disabled("reddit"):
+            self._mark_source("reddit", "disabled")
+            return 0
         if not (self.settings.reddit_client_id and self.settings.reddit_client_secret):
             self._mark_source("reddit", "missing")
             return 0
@@ -163,14 +179,20 @@ class EnrichmentClient:
             self._cache_set(self._reddit_cache, symbol, mentions)
             return mentions
         except ModuleNotFoundError:
-            self._mark_source("reddit", "error", "praw_missing")
+            self._disable_source("reddit")
+            self._mark_source("reddit", "disabled", "praw_missing")
             return 0
         except Exception as exc:
-            self._mark_source("reddit", "error", self._generic_error_key(exc))
+            error_key = self._generic_error_key(exc)
+            if error_key in {"unauthorized", "forbidden"}:
+                self._disable_source("reddit")
+                self._mark_source("reddit", "disabled", error_key)
+            else:
+                self._mark_source("reddit", "error", error_key)
             return 0
 
     def _google_trends_change(self, symbol: str) -> float:
-        if not self.settings.enable_google_trends:
+        if not self.settings.enable_google_trends or self._source_disabled("google_trends"):
             self._mark_source("google_trends", "disabled")
             return 0.0
 
@@ -205,11 +227,17 @@ class EnrichmentClient:
             self._mark_source("google_trends", "ok")
             return change
         except ModuleNotFoundError:
-            self._mark_source("google_trends", "error", "pytrends_missing")
+            self._disable_source("google_trends")
+            self._mark_source("google_trends", "disabled", "pytrends_missing")
             self._google_trends_cache[symbol] = (now, 0.0)
             return 0.0
         except Exception as exc:
-            self._mark_source("google_trends", "error", self._generic_error_key(exc))
+            error_key = self._generic_error_key(exc)
+            if error_key in {"rate_limited", "unauthorized", "forbidden"}:
+                self._disable_source("google_trends")
+                self._mark_source("google_trends", "disabled", error_key)
+            else:
+                self._mark_source("google_trends", "error", error_key)
             self._google_trends_cache[symbol] = (now, 0.0)
             return 0.0
 
@@ -244,6 +272,12 @@ class EnrichmentClient:
     def _cache_set(cache: dict[str, tuple[datetime, T]], symbol: str, value: T) -> None:
         cache[symbol] = (datetime.now(UTC), value)
 
+    def _disable_source(self, source: str) -> None:
+        self._disabled_sources.add(source)
+
+    def _source_disabled(self, source: str) -> bool:
+        return source in self._disabled_sources
+
     @staticmethod
     def _request_error_key(exc: requests.RequestException) -> str:
         response = getattr(exc, "response", None)
@@ -255,6 +289,10 @@ class EnrichmentClient:
         if "connection" in text:
             return "connection"
         return "request_failed"
+
+    @staticmethod
+    def _is_auth_error(error_key: str) -> bool:
+        return error_key in {"http_401", "http_403"}
 
     @staticmethod
     def _generic_error_key(exc: Exception) -> str:

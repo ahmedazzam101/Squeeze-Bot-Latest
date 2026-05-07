@@ -54,6 +54,8 @@ class Bot:
         claude_status_counts: Counter[str] = Counter()
         snapshot_error_counts: Counter[str] = Counter()
         top_candidates: list[dict] = []
+        finalist_audits: list[dict] = []
+        finalist_counts: Counter[str] = Counter()
         self.enrichment.reset_status()
         self.storage.set_state("heartbeat", {"at": time.time(), "watchlist": list(settings.watchlist)})
         self._run_discovery_if_due()
@@ -119,6 +121,11 @@ class Bot:
                 decision = self.policy.decide_entry(snapshot, scores, analysis, risk_state, regime_passed, regime_reason)
                 if symbol in opportunity_symbols:
                     scored_entries[symbol] = (scores, analysis, decision, snapshot, regime_passed, regime_reason)
+                audit = self._entry_gate_audit(snapshot, scores, decision, risk_state, regime_passed, regime_reason, claude_status)
+                finalist_audits.append(audit)
+                for key, value in audit.items():
+                    if isinstance(value, bool) and value:
+                        finalist_counts[key] += 1
             action_counts[decision.action.value] += 1
             top_candidates.append(
                 {
@@ -171,6 +178,8 @@ class Bot:
             claude_status_counts,
             snapshot_error_counts,
             top_candidates,
+            finalist_audits,
+            finalist_counts,
             self.enrichment.status_summary(),
             risk_state,
             regime_passed,
@@ -191,6 +200,7 @@ class Bot:
             and (
                 in_position
                 or preliminary.composite >= settings.claude_min_composite_score
+                or self._is_claude_finalist(snapshot, preliminary)
                 or (
                     preliminary.acceleration >= settings.claude_min_acceleration_score
                     and snapshot.rvol >= settings.claude_min_rvol
@@ -212,6 +222,68 @@ class Bot:
         self.claude_spend_today += float(analysis.raw.get("_estimated_cost_usd", settings.claude_estimated_cost_per_call_usd) or settings.claude_estimated_cost_per_call_usd)
         self.claude_cache[symbol] = (time.time(), analysis)
         return analysis, "called"
+
+    @staticmethod
+    def _is_claude_finalist(snapshot, scores) -> bool:
+        if not settings.claude_call_finalists:
+            return False
+        near_breakout = snapshot.near_breakout(settings.early_probe_breakout_distance_pct)
+        above_vwap = snapshot.above_vwap_candles >= settings.high_conviction_above_vwap_candles
+        standard_finalist = (
+            scores.composite >= settings.claude_finalist_min_composite_score
+            and scores.acceleration >= settings.claude_finalist_min_acceleration_score
+            and snapshot.rvol >= settings.claude_finalist_min_rvol
+            and near_breakout
+            and above_vwap
+        )
+        market_data_override = (
+            scores.acceleration >= settings.early_probe_strong_acceleration_score
+            and snapshot.rvol >= settings.early_probe_strong_rvol
+            and near_breakout
+            and above_vwap
+        )
+        return standard_finalist or market_data_override
+
+    def _entry_gate_audit(self, snapshot, scores, decision, risk_state, regime_passed: bool, regime_reason: str, claude_status: str) -> dict:
+        near_breakout = snapshot.near_breakout(settings.early_probe_breakout_distance_pct)
+        market_data_setup = (
+            (
+                snapshot.breakout_confirmed
+                and snapshot.rvol >= settings.min_rvol
+                and snapshot.above_vwap_candles >= settings.min_above_vwap_candles
+            )
+            or (
+                near_breakout
+                and scores.acceleration >= settings.early_probe_min_acceleration_score
+                and snapshot.rvol >= settings.early_probe_min_rvol
+                and snapshot.above_vwap_candles >= settings.high_conviction_above_vwap_candles
+            )
+            or (
+                near_breakout
+                and scores.acceleration >= settings.early_probe_strong_acceleration_score
+                and snapshot.rvol >= settings.early_probe_strong_rvol
+                and snapshot.above_vwap_candles >= settings.high_conviction_above_vwap_candles
+            )
+        )
+        risk_allowed, risk_reason = self.policy.risk.can_enter(risk_state, snapshot)
+        return {
+            "symbol": snapshot.symbol,
+            "market_data_setup": market_data_setup,
+            "near_breakout": near_breakout,
+            "breakout_confirmed": snapshot.breakout_confirmed,
+            "above_vwap": snapshot.above_vwap_candles >= settings.high_conviction_above_vwap_candles,
+            "risk_allowed": risk_allowed,
+            "regime_passed": regime_passed,
+            "claude_finalist": self._is_claude_finalist(snapshot, scores),
+            "claude_called": claude_status == "called",
+            "buy_decision": decision.action.value == "BUY",
+            "score": scores.composite,
+            "acceleration": scores.acceleration,
+            "rvol": snapshot.rvol,
+            "reason": decision.reason,
+            "risk_reason": risk_reason,
+            "regime_reason": regime_reason,
+        }
 
     def _reset_claude_budget_if_needed(self) -> None:
         today = datetime.now(UTC).date()
@@ -317,6 +389,7 @@ class Bot:
             f"alpaca={alpaca} execution={execution}_{execution_mode} dry_run={settings.dry_run} "
             f"claude={claude} model={settings.claude_model} "
             f"claude_budget=${settings.claude_daily_budget_usd:.2f}/day max_calls={settings.claude_max_calls_per_day} "
+            f"claude_finalists={settings.claude_call_finalists} "
             f"fmp={fmp} finnhub={finnhub} reddit={reddit} google_trends={google_trends} "
             f"discovery=every_{settings.discovery_interval_seconds}s max_symbols={settings.discovery_max_symbols} "
             f"opportunity_scan_limit={settings.opportunity_scan_limit} snapshot_cache={settings.market_snapshot_cache_seconds}s"
@@ -329,6 +402,8 @@ class Bot:
         claude_status_counts: Counter[str],
         snapshot_error_counts: Counter[str],
         top_candidates: list[dict],
+        finalist_audits: list[dict],
+        finalist_counts: Counter[str],
         enrichment_summary: dict,
         risk_state,
         regime_passed: bool,
@@ -345,6 +420,10 @@ class Bot:
                 "actions": dict(action_counts),
                 "claude": dict(claude_status_counts),
                 "snapshot_errors": dict(snapshot_error_counts),
+                "buy_gate_audit": {
+                    "counts": dict(finalist_counts),
+                    "finalists": self._rank_audits(finalist_audits)[: settings.log_top_candidates],
+                },
                 "enrichment": enrichment_summary,
                 "top_candidates": sorted(top_candidates, key=lambda item: item["score"], reverse=True)[: settings.log_top_candidates],
                 "regime": {"passed": regime_passed, "reason": regime_reason},
@@ -372,7 +451,45 @@ class Bot:
             log(f"Data source issues: {self._format_counter(enrichment_errors, limit=5)}")
         if snapshot_error_counts:
             log(f"Snapshot issues: {self._format_counter(snapshot_error_counts, limit=3)}")
+        self._log_buy_gate_audit(finalist_audits, finalist_counts)
         self._log_top_candidates(top_candidates)
+
+    def _log_buy_gate_audit(self, audits: list[dict], counts: Counter[str]) -> None:
+        if not audits:
+            return
+        log(
+            "Buy gate audit: "
+            f"market_data_setup={counts.get('market_data_setup', 0)} "
+            f"risk_allowed={counts.get('risk_allowed', 0)} "
+            f"claude_finalists={counts.get('claude_finalist', 0)} "
+            f"claude_called={counts.get('claude_called', 0)} "
+            f"buy_decisions={counts.get('buy_decision', 0)}"
+        )
+        ranked = self._rank_audits(audits)[: settings.log_top_candidates]
+        parts = []
+        for item in ranked:
+            parts.append(
+                f"{item['symbol']} market={item['market_data_setup']} risk={item['risk_allowed']} "
+                f"claude_finalist={item['claude_finalist']} claude_called={item['claude_called']} "
+                f"buy={item['buy_decision']} score={item['score']:.1f} accel={item['acceleration']:.1f} "
+                f"rvol={item['rvol']:.2f} reason={self._clip(item['reason'], 80)}"
+            )
+        log(f"Buy gate finalists: {' | '.join(parts)}")
+
+    @staticmethod
+    def _rank_audits(audits: list[dict]) -> list[dict]:
+        return sorted(
+            audits,
+            key=lambda item: (
+                bool(item.get("buy_decision")),
+                bool(item.get("market_data_setup")),
+                bool(item.get("claude_finalist")),
+                float(item.get("acceleration", 0) or 0),
+                float(item.get("rvol", 0) or 0),
+                float(item.get("score", 0) or 0),
+            ),
+            reverse=True,
+        )
 
     def _log_top_candidates(self, candidates: list[dict]) -> None:
         limit = max(0, settings.log_top_candidates)

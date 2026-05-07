@@ -26,6 +26,11 @@ class TradingPolicy:
             and near_breakout
             and snapshot.above_vwap_candles >= self.settings.high_conviction_above_vwap_candles
         )
+        early_probe_market_data_override = (
+            scores.acceleration >= self.settings.early_probe_strong_acceleration_score
+            and snapshot.rvol >= self.settings.early_probe_strong_rvol
+            and near_breakout
+        )
         regime_allows = regime_passed or not self.settings.require_regime_filter or (
             self.settings.allow_high_conviction_regime_bypass
             and scores.composite >= self.settings.high_conviction_score
@@ -75,7 +80,7 @@ class TradingPolicy:
         early_squeeze_probe_path = all(
             [
                 self.settings.enable_early_squeeze_probe,
-                scores.composite >= self.settings.early_probe_min_composite_score,
+                scores.composite >= self.settings.early_probe_min_composite_score or early_probe_market_data_override,
                 scores.acceleration >= self.settings.early_probe_min_acceleration_score,
                 scores.acceleration_rising,
                 near_breakout,
@@ -125,6 +130,7 @@ class TradingPolicy:
                 "entry_path": entry_path,
                 "breakout_distance_pct": snapshot.breakout_distance_pct,
                 "stock_specific_regime_bypass": stock_specific_regime_bypass,
+                "early_probe_market_data_override": early_probe_market_data_override,
             },
         )
 

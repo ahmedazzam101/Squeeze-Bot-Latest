@@ -121,6 +121,28 @@ def test_policy_blocks_early_probe_when_too_far_from_breakout():
     assert decision.action != TradeAction.BUY
 
 
+def test_policy_allows_market_data_override_when_enrichment_is_weak():
+    policy = TradingPolicy(Settings(require_regime_filter=False))
+    snapshot = MarketSnapshot(
+        symbol="FAST",
+        price=5.10,
+        rvol=500,
+        vwap=5.0,
+        above_vwap_candles=1,
+        premarket_high=5.0,
+        resistance=5.05,
+        bid=5.09,
+        ask=5.11,
+    )
+    scores = Scores(35, 60, 25, 10, 36, True)
+    analysis = ClaudeAnalysis(ClaudeVote.WATCH, 0.45, 0.1, 0.2, 0.1, "fallback watch")
+    risk = RiskState(10_000, 10_000, 0, 0, 0, 0)
+    decision = policy.decide_entry(snapshot, scores, analysis, risk, True, "ok")
+    assert decision.action == TradeAction.BUY
+    assert decision.metadata["entry_path"] == "early_squeeze_probe"
+    assert decision.metadata["early_probe_market_data_override"] is True
+
+
 def test_policy_records_block_reasons():
     policy = TradingPolicy(Settings(require_regime_filter=False))
     snapshot = MarketSnapshot(symbol="TEST", price=10, rvol=1, vwap=11, above_vwap_candles=0)
