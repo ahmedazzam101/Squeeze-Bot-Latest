@@ -316,14 +316,22 @@ class Bot:
         discovered = self.discovery.discover(exclude=set(settings.watchlist) | positions)
         for opportunity in discovered:
             self.storage.upsert_opportunity(opportunity)
+        discovery_summary = self.discovery.last_summary or {}
+        counts = discovery_summary.get("counts", {})
+        counts_text = self._format_counter(Counter(counts)) if isinstance(counts, dict) else "none"
         if discovered:
             log(
                 "Discovery added "
                 f"{len(discovered)}/{settings.discovery_max_symbols}: "
-                f"{', '.join(op.symbol for op in discovered)}"
+                f"{', '.join(op.symbol for op in discovered)} "
+                f"| counts={counts_text}"
             )
         else:
-            log("Discovery found no new candidates")
+            sample = discovery_summary.get("source_sample", [])
+            sample_text = ",".join(sample) if isinstance(sample, list) else ""
+            errors = discovery_summary.get("endpoint_errors", [])
+            error_text = f" errors={','.join(errors)}" if isinstance(errors, list) and errors else ""
+            log(f"Discovery found no new candidates | counts={counts_text} sample={sample_text}{error_text}")
 
     def _maybe_swap(self, scored_positions: dict, scored_entries: dict, risk_state) -> None:
         if not settings.enable_swaps or not scored_positions or not scored_entries:
@@ -546,7 +554,7 @@ def run_worker() -> None:
     alpaca_status = "configured" if bot.market.configured() else "missing Alpaca API key/secret"
     log(
         "Worker started. "
-        f"Watchlist={','.join(settings.watchlist)} "
+        f"Watchlist={','.join(settings.watchlist) if settings.watchlist else '<discovery-only>'} "
         f"interval={settings.scan_interval_seconds}s "
         f"dry_run={settings.dry_run} "
         f"alpaca={alpaca_status} "
