@@ -143,6 +143,48 @@ def test_policy_allows_market_data_override_when_enrichment_is_weak():
     assert decision.metadata["early_probe_market_data_override"] is True
 
 
+def test_policy_allows_tiny_paper_probe_for_market_setup():
+    policy = TradingPolicy(Settings(require_regime_filter=False, alpaca_paper=True))
+    snapshot = MarketSnapshot(
+        symbol="PAPER",
+        price=10,
+        rvol=2.4,
+        vwap=9.9,
+        above_vwap_candles=1,
+        premarket_high=9.9,
+        resistance=9.95,
+        bid=9.98,
+        ask=10.02,
+    )
+    scores = Scores(40, 12, 35, 20, 44, True)
+    analysis = ClaudeAnalysis(ClaudeVote.WATCH, 0.45, 0.1, 0.2, 0.1, "paper probe")
+    risk = RiskState(10_000, 10_000, 0, 0, 0, 0)
+    decision = policy.decide_entry(snapshot, scores, analysis, risk, True, "ok")
+    assert decision.action == TradeAction.BUY
+    assert decision.metadata["entry_path"] == "paper_probe"
+    assert decision.metadata["paper_probe"] is True
+
+
+def test_policy_blocks_paper_probe_on_claude_ignore():
+    policy = TradingPolicy(Settings(require_regime_filter=False, alpaca_paper=True))
+    snapshot = MarketSnapshot(
+        symbol="IGNORE",
+        price=10,
+        rvol=2.4,
+        vwap=9.9,
+        above_vwap_candles=1,
+        premarket_high=9.9,
+        resistance=9.95,
+        bid=9.98,
+        ask=10.02,
+    )
+    scores = Scores(40, 12, 35, 20, 44, True)
+    analysis = ClaudeAnalysis(ClaudeVote.IGNORE, 0.45, 0.1, 0.2, 0.1, "ignore")
+    risk = RiskState(10_000, 10_000, 0, 0, 0, 0)
+    decision = policy.decide_entry(snapshot, scores, analysis, risk, True, "ok")
+    assert decision.action != TradeAction.BUY
+
+
 def test_policy_records_block_reasons():
     policy = TradingPolicy(Settings(require_regime_filter=False))
     snapshot = MarketSnapshot(symbol="TEST", price=10, rvol=1, vwap=11, above_vwap_candles=0)

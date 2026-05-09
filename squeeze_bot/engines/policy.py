@@ -90,7 +90,21 @@ class TradingPolicy:
                 regime_allows,
             ]
         )
-        if not (strict_path or high_conviction_path or momentum_breakout_path or early_squeeze_probe_path):
+        paper_probe_path = all(
+            [
+                self.settings.enable_paper_probe_entry,
+                self.settings.alpaca_paper,
+                scores.composite >= self.settings.paper_probe_min_composite_score,
+                scores.acceleration >= self.settings.paper_probe_min_acceleration_score,
+                snapshot.breakout_confirmed or near_breakout,
+                snapshot.rvol >= self.settings.paper_probe_min_rvol,
+                snapshot.above_vwap_candles >= self.settings.high_conviction_above_vwap_candles,
+                analysis.vote != ClaudeVote.IGNORE,
+                risk_flags_clear,
+                regime_allows,
+            ]
+        )
+        if not (strict_path or high_conviction_path or momentum_breakout_path or early_squeeze_probe_path or paper_probe_path):
             reasons = self._entry_block_reasons(snapshot, scores, analysis, regime_allows, regime_reason, claude_allows, risk_flags_clear)
             return Decision(
                 snapshot.symbol,
@@ -113,9 +127,13 @@ class TradingPolicy:
             else "momentum_breakout"
             if momentum_breakout_path
             else "early_squeeze_probe"
+            if early_squeeze_probe_path
+            else "paper_probe"
         )
         if entry_path == "early_squeeze_probe":
             quantity = max(1, int(quantity * max(0.1, min(1.0, self.settings.early_probe_risk_multiplier))))
+        if entry_path == "paper_probe":
+            quantity = max(1, int(quantity * max(0.05, min(1.0, self.settings.paper_probe_risk_multiplier))))
         return Decision(
             symbol=snapshot.symbol,
             action=TradeAction.BUY,
@@ -131,6 +149,7 @@ class TradingPolicy:
                 "breakout_distance_pct": snapshot.breakout_distance_pct,
                 "stock_specific_regime_bypass": stock_specific_regime_bypass,
                 "early_probe_market_data_override": early_probe_market_data_override,
+                "paper_probe": paper_probe_path,
             },
         )
 
